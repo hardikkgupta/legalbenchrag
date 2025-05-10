@@ -22,6 +22,8 @@ from pydantic import BaseModel, computed_field
 
 from legalbenchrag.utils.credentials import credentials
 
+import numpy as np
+
 logger = logging.getLogger("uvicorn")
 
 # AI Types
@@ -617,3 +619,30 @@ async def ai_rerank(
                 raise AITimeoutError("Cannot overcome VoyageAI RateLimitError")
     cache.set(cache_key, indices)
     return indices
+
+
+class EmbeddingCache:
+    def __init__(self, cache_dir: str = "./cache/embeddings"):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+    
+    def _get_cache_key(self, text: str, model: AIEmbeddingModel) -> str:
+        # Create a unique key based on the text and model configuration
+        key_data = f"{text}|{model.company}|{model.model}"
+        return hashlib.md5(key_data.encode()).hexdigest()
+    
+    def get(self, text: str, model: AIEmbeddingModel) -> np.ndarray | None:
+        cache_key = self._get_cache_key(text, model)
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.npy")
+        
+        if os.path.exists(cache_path):
+            return np.load(cache_path)
+        return None
+    
+    def set(self, text: str, model: AIEmbeddingModel, embedding: np.ndarray) -> None:
+        cache_key = self._get_cache_key(text, model)
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.npy")
+        np.save(cache_path, embedding)
+
+# Global embedding cache instance
+embedding_cache = EmbeddingCache()

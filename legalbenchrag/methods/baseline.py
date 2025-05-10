@@ -1,7 +1,8 @@
 import os
 import sqlite3
 import struct
-from typing import Literal, cast
+import re
+from typing import Literal, cast, Any
 
 import sqlite_vec  # type: ignore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -20,7 +21,12 @@ from legalbenchrag.utils.ai import (
     AIRerankModel,
     ai_embedding,
     ai_rerank,
+    embedding_cache,
+    get_embeddings,
+    get_rerank_scores,
 )
+
+import numpy as np
 
 
 def serialize_f32(vector: list[float]) -> bytes:
@@ -32,7 +38,7 @@ SHOW_LOADING_BAR = True
 
 
 class ChunkingStrategy(BaseModel):
-    strategy_name: Literal["naive", "rcts"]
+    strategy_name: Literal["naive", "rcts", "semantic"]
     chunk_size: int
 
 
@@ -48,6 +54,42 @@ class RetrievalStrategy(BaseModel):
 class EmbeddingInfo(BaseModel):
     document_id: str
     span: tuple[int, int]
+
+
+class SemanticChunkingStrategy(ChunkingStrategy):
+    def __init__(
+        self,
+        strategy_name: Literal["semantic"] = "semantic",
+        chunk_size: int = 500,
+        overlap_size: int = 100,
+    ):
+        super().__init__(strategy_name=strategy_name, chunk_size=chunk_size)
+        self.overlap_size = overlap_size
+
+    def chunk(self, text: str) -> list[str]:
+        # Split text into paragraphs
+        paragraphs = re.split(r'\n\s*\n', text)
+        chunks: list[str] = []
+        current_chunk = ""
+        
+        for paragraph in paragraphs:
+            # If adding this paragraph would exceed chunk size
+            if len(current_chunk) + len(paragraph) > self.chunk_size:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                    # Keep last overlap_size characters for context
+                    current_chunk = current_chunk[-self.overlap_size:] if self.overlap_size > 0 else ""
+            
+            # Add paragraph to current chunk
+            if current_chunk:
+                current_chunk += "\n\n"
+            current_chunk += paragraph
+        
+        # Add the last chunk if it's not empty
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
 
 
 class BaselineRetrievalMethod(RetrievalMethod):
@@ -114,6 +156,8 @@ class BaselineRetrievalMethod(RetrievalMethod):
                         strip_whitespace=False,
                     )
                     text_splits = synthetic_data_splitter.split_text(document.content)
+                case "semantic":
+                    text_splits = self.retrieval_strategy.chunking_strategy.chunk(document.content)
             assert sum(len(text_split) for text_split in text_splits) == len(
                 document.content
             )
@@ -145,13 +189,8 @@ class BaselineRetrievalMethod(RetrievalMethod):
         for i in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
             chunk_batch = chunks[i : i + EMBEDDING_BATCH_SIZE]
             assert len(chunk_batch) > 0
-            embeddings = await ai_embedding(
-                self.retrieval_strategy.embedding_model,
-                [chunk.content for chunk in chunk_batch],
-                AIEmbeddingType.DOCUMENT,
-                callback=lambda: (progress_bar.update(1), None)[1]
-                if progress_bar
-                else None,
+            embeddings = await self.get_embeddings_for_chunks(
+                [chunk.content for chunk in chunk_batch]
             )
             assert len(chunk_batch) == len(embeddings)
             # Save the Info
@@ -190,14 +229,28 @@ class BaselineRetrievalMethod(RetrievalMethod):
         if progress_bar:
             progress_bar.close()
 
+    async def get_embeddings_for_chunks(
+        self, chunks: list[str]
+    ) -> list[np.ndarray]:
+        embeddings: list[np.ndarray] = []
+        for chunk in chunks:
+            # Try to get from cache first
+            cached_embedding = embedding_cache.get(chunk, self.retrieval_strategy.embedding_model)
+            if cached_embedding is not None:
+                embeddings.append(cached_embedding)
+            else:
+                # If not in cache, generate and cache it
+                embedding = await get_embeddings(chunk, self.retrieval_strategy.embedding_model)
+                embedding_cache.set(chunk, self.retrieval_strategy.embedding_model, embedding)
+                embeddings.append(embedding)
+        return embeddings
+
     async def query(self, query: str) -> QueryResponse:
         if self.sqlite_db is None or self.embedding_infos is None:
             raise ValueError("Sync documents before querying!")
         # Get TopK Embedding results
         query_embedding = (
-            await ai_embedding(
-                self.retrieval_strategy.embedding_model, [query], AIEmbeddingType.QUERY
-            )
+            await get_embeddings(query, self.retrieval_strategy.embedding_model)
         )[0]
         rows = self.sqlite_db.execute(
             """
@@ -216,13 +269,10 @@ class BaselineRetrievalMethod(RetrievalMethod):
 
         # Rerank
         if self.retrieval_strategy.rerank_model is not None:
-            reranked_indices = await ai_rerank(
+            reranked_indices = await get_rerank_scores(
                 self.retrieval_strategy.rerank_model,
                 query,
-                texts=[
-                    self.get_embedding_info_text(embedding_info)
-                    for embedding_info in retrieved_embedding_infos
-                ],
+                [self.get_embedding_info_text(embedding_info) for embedding_info in retrieved_embedding_infos],
             )
             retrieved_embedding_infos = [
                 retrieved_embedding_infos[i]
